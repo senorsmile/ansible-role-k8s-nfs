@@ -1,0 +1,115 @@
+---
+- name: nfs-server-pod 
+  k8s:
+    namespace: default
+    state: "{{ nfs_cluster_state }}"
+    definition: |
+      kind: Pod
+      apiVersion: v1
+      metadata:
+        name: nfs-server-pod
+        labels:
+          role: nfs
+      spec:
+        containers:
+          - name: nfs-server-container
+            image: cpuguy83/nfs-server
+            securityContext:
+              privileged: true
+            args:
+              # Pass the paths to share to the Docker image
+              - /exports
+
+- name: nfs-service
+  k8s:
+    namespace: default
+    state: "{{ nfs_cluster_state }}"
+    definition: |
+      kind: Service
+      apiVersion: v1
+      metadata:
+        name: nfs-service
+      spec:
+        selector:
+          role: nfs
+        ports:
+          # Open the ports required by the NFS server
+          # Port 2049 for TCP
+          - name: tcp-2049
+            port: 2049
+            protocol: TCP
+
+          # Port 111 for UDP
+          - name: udp-111
+            port: 111
+            protocol: UDP
+
+
+- name: Get nfs-server-pod facts
+  k8s_facts:
+    api_version: v1
+    kind: service
+    name: nfs-service
+    namespace: default
+  register: nfs_service_facts
+  when: nfs_cluster_state == 'present'
+
+- name: Debug nfs service facts
+  debug:
+    msg: "{{ nfs_service_facts }}"
+  when: nfs_cluster_state == 'present'
+
+- name: Debug print cluster ip
+  debug:
+    msg: "{{ nfs_service_facts['resources'][0]['spec']['clusterIP'] }}"
+  when: nfs_cluster_state == 'present'
+
+
+## must use the following force to delete the pod for some reason
+## `kubectl delete pod pod-using-nfs --force --grace-period=0`
+- name: pod-using-nfs
+  k8s:
+    namespace: default
+    state: "{{ nfs_cluster_state }}"
+    definition: |
+      kind: Pod
+      apiVersion: v1
+      metadata:
+        name: pod-using-nfs
+      spec:
+        # Add the server as an NFS volume for the pod
+        volumes:
+          - name: nfs-volume
+            nfs: 
+              # URL for the NFS server
+              #server: 10.233.64.33 # 10.108.211.244 # Change this!
+              server: "{% if 'resources' in nfs_service_facts %}{{ nfs_service_facts['resources'][0]['spec']['clusterIP'] }}{% else %}'CANNOT_FIND'{% endif %}"
+              path: /
+
+        # In this container, we'll mount the NFS volume
+        # and write the date to a file inside it.
+        containers:
+          - name: app
+            image: alpine
+
+            # Mount the NFS volume in the container
+            volumeMounts:
+              - name: nfs-volume
+                mountPath: /var/nfs
+
+            # Write to a file inside our NFS
+            command: ["/bin/sh"]
+            args: ["-c", "while true; do date >> /var/nfs/dates.txt; sleep 5; done"]
+  #when: nfs_service_facts is defined and 'resources' in nfs_service_facts
+
+- name: Display date file on nfs mount
+  shell: |
+    sleep 5
+    kubectl exec -it pod-using-nfs cat /var/nfs/dates.txt  
+  register: nfs_date_file
+  when: nfs_cluster_state == 'present'
+  changed_when: False
+
+- debug:
+    msg: "{{ nfs_date_file.stdout }}"
+  when: nfs_cluster_state == 'present'
